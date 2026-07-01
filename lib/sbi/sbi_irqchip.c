@@ -412,14 +412,13 @@ struct sbi_irqchip_device *sbi_irqchip_find_device_by_caps(unsigned long caps,
 							   struct sbi_irqchip_device *first)
 {
 	struct sbi_irqchip_device *chip;
-	bool found = false;
+	bool found = (first == NULL);
 
 	sbi_list_for_each_entry(chip, &irqchip_list, node) {
 		if (!found) {
 			if (first == chip)
 				found = true;
-			else
-				continue;
+			continue;
 		}
 		if ((chip->caps & caps) == caps)
 			return chip;
