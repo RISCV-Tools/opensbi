@@ -664,6 +664,7 @@ int fdt_parse_aplic_node(const void *fdt, int nodeoff, struct aplic_data *aplic)
 
 	rc = fdt_aplic_find_imsic_node(fdt, nodeoff, &imsic, true);
 	if (!rc) {
+		aplic->parent_unique_id = imsic.unique_id;
 		aplic->targets_mmode = true;
 		aplic->has_msicfg_mmode = true;
 		aplic->msicfg_mmode.lhxs = imsic.guest_index_bits;

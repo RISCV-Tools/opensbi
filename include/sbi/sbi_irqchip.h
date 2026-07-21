@@ -107,6 +107,12 @@ int sbi_irqchip_unmask_hwirq(struct sbi_irqchip_device *chip, u32 hwirq);
 /** Mask a hardware interrupt */
 int sbi_irqchip_mask_hwirq(struct sbi_irqchip_device *chip, u32 hwirq);
 
+/** Helper to set private data in sbi_irqchip_hwirq_data */
+int sbi_irqchip_set_hwirq_priv(struct sbi_irqchip_device *chip, u32 hwirq, void *priv);
+
+/** Helper to retrieve data from sbi_irqchip_hwirq_data */
+void *sbi_irqchip_get_hwirq_priv(struct sbi_irqchip_device *chip, u32 hwirq);
+
 /** Default raw hardware interrupt handler */
 int sbi_irqchip_raw_handler_default(struct sbi_irqchip_device *chip, u32 hwirq);
 

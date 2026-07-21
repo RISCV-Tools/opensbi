@@ -22,6 +22,9 @@ struct sbi_irqchip_hwirq_data {
 
 	/** target hart index */
 	u32 hart_index;
+
+	/** chip's private data */
+	void *priv;
 };
 
 /** Internal irqchip interrupt handler */
@@ -111,6 +114,30 @@ static struct sbi_irqchip_handler *sbi_irqchip_find_handler(struct sbi_irqchip_d
 	}
 
 	return NULL;
+}
+
+int sbi_irqchip_set_hwirq_priv(struct sbi_irqchip_device *chip, u32 hwirq, void *priv)
+{
+	struct sbi_irqchip_hwirq_data *data;
+
+	if (!chip || chip->num_hwirq <= hwirq)
+	     return SBI_EINVAL;
+
+	data = &chip->hwirqs[hwirq];
+	data->priv = priv;
+
+	return 0;
+}
+
+void *sbi_irqchip_get_hwirq_priv(struct sbi_irqchip_device *chip, u32 hwirq)
+{
+	struct sbi_irqchip_hwirq_data *data;
+	if (!chip || chip->num_hwirq <= hwirq)
+	    return NULL;
+
+	data = &chip->hwirqs[hwirq];
+
+	return data->priv;
 }
 
 int sbi_irqchip_raw_handler_default(struct sbi_irqchip_device *chip, u32 hwirq)

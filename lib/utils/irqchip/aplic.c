@@ -12,6 +12,7 @@
 #include <sbi/sbi_console.h>
 #include <sbi/sbi_domain.h>
 #include <sbi/sbi_error.h>
+#include <sbi/sbi_heap.h>
 #include <sbi_utils/irqchip/aplic.h>
 
 #define APLIC_MAX_IDC			(1UL << 14)
@@ -73,6 +74,8 @@
 #define APLIC_TARGET_GUEST_IDX(__gidx) \
 	((((u32)(__gidx)) & APLIC_TARGET_GUEST_IDX_MASK) << \
 	 APLIC_TARGET_GUEST_IDX_SHIFT)
+#define APLIC_TARGET_EIID(__eiid) \
+	(((u32)(__eiid)) & APLIC_TARGET_EIID_MASK)
 
 #define APLIC_SETIP_BASE		0x1c00
 #define APLIC_SETIPNUM			0x1cdc
@@ -125,6 +128,12 @@
 #define APLIC_DISABLE_ITHRESHOLD	1
 #define APLIC_ENABLE_ITHRESHOLD		0
 
+struct aplic_msi_data {
+	struct aplic_data *aplic;
+	u32 hwirq;
+	u32 parent_hwirq;
+};
+
 static SBI_LIST_HEAD(aplic_list);
 static void aplic_writel_msicfg(struct aplic_msicfg_data *msicfg,
 				void *msicfgaddr, void *msicfgaddrH);
@@ -167,6 +176,21 @@ static inline void aplic_irq_clrie(struct aplic_data *aplic, u32 hwirq)
 static inline void aplic_irq_clrip(struct aplic_data *aplic, u32 hwirq)
 {
 	writel(hwirq, (void *)(aplic->addr + APLIC_CLRIPNUM));
+}
+
+static inline void aplic_msi_irq_retrigger_level(struct aplic_data *aplic, u32 hwirq)
+{
+	/*
+	 * The section "4.9.2 Special consideration for level-sensitive interrupt
+	 * sources" of the RISC-V AIA specification says:
+	 *
+	 * A second option is for the interrupt service routine to write the
+	 * APLIC’s source identity number for the interrupt to the domain’s
+	 * setipnum register just before exiting. This will cause the interrupt’s
+	 * pending bit to be set to one again if the source is still asserting
+	 * an interrupt, but not if the source is not asserting an interrupt.
+	 */
+	writel(hwirq, (void *)(aplic->addr + APLIC_SETIPNUM_LE));
 }
 
 static inline void *aplic_idc_base(struct aplic_data *aplic, u32 idc_index)
@@ -292,6 +316,8 @@ static void aplic_init(struct aplic_data *aplic)
 	}
 
 	domaincfg = APLIC_DOMAINCFG_IE;
+	if (!aplic_is_direct_mode(aplic))
+		domaincfg |= APLIC_DOMAINCFG_DM;
 
 	writel(domaincfg, (void *)(aplic->addr + APLIC_DOMAINCFG));
 }
@@ -357,6 +383,8 @@ static int aplic_warm_init(struct sbi_irqchip_device *chip)
 	int idc_index;
 
 	aplic = container_of(chip, struct aplic_data, irqchip);
+	if (!aplic_is_direct_mode(aplic))
+		return 0;
 
 	hart_index = current_hartindex();
 	idc_index  = aplic_find_idc_index(aplic, hart_index);
@@ -378,6 +406,9 @@ static int aplic_process_hwirqs(struct sbi_irqchip_device *chip)
 	int idc_index, rc = 0, tmp;
 
 	aplic = container_of(chip, struct aplic_data, irqchip);
+
+	if (!aplic_is_direct_mode(aplic))
+		sbi_panic("aplic_process_hwirqs called in MSI mode.\n");
 
 	hart_index = current_hartindex();
 	idc_index  = aplic_find_idc_index(aplic, hart_index);
@@ -402,6 +433,122 @@ static int aplic_process_hwirqs(struct sbi_irqchip_device *chip)
 	return rc;
 }
 
+static void aplic_hwirq_eoi(struct sbi_irqchip_device *chip, u32 hwirq)
+{
+	struct aplic_data *aplic;
+	u32 sm;
+
+	aplic = container_of(chip, struct aplic_data, irqchip);
+	if (aplic_is_direct_mode(aplic))
+		return;
+
+	sm = aplic_sourcecfg_read(aplic, hwirq) & APLIC_SOURCECFG_SM_MASK;
+	if (sm == APLIC_SOURCECFG_SM_LEVEL_HIGH ||
+	    sm == APLIC_SOURCECFG_SM_LEVEL_LOW)
+		aplic_msi_irq_retrigger_level(aplic, hwirq);
+}
+
+static void aplic_program_msi_target(struct aplic_data *aplic,
+				     u32 hwirq, u32 hart_index,
+				     u32 guest_index, u32 eiid)
+{
+	u32 target;
+
+	target = APLIC_TARGET_HART_IDX(hart_index) |
+		 APLIC_TARGET_GUEST_IDX(guest_index) |
+		 APLIC_TARGET_EIID(eiid);
+
+	aplic_target_write(aplic, hwirq, target);
+}
+
+static u32 derive_hart_index(struct aplic_msicfg_data *msicfg,
+			      const struct sbi_irqchip_msi_msg *msg)
+{
+	u64 addr = ((u64)msg->address_hi << 32) | msg->address_lo;
+	u64 tppn = addr >> APLIC_xMSICFGADDR_PPN_SHIFT;
+	u32 group_index, hart_index;
+
+	group_index = (tppn >> APLIC_xMSICFGADDR_PPN_HHX_SHIFT(msicfg->hhxs)) &
+		      APLIC_xMSICFGADDR_PPN_HHX_MASK(msicfg->hhxw);
+
+	hart_index = (tppn >> msicfg->lhxs) &
+		     ((1UL << msicfg->lhxw) - 1);
+
+	hart_index |= (group_index << msicfg->lhxw);
+
+	return hart_index;
+}
+
+static void aplic_write_msi(u32 parent_hwirq,
+			    const struct sbi_irqchip_msi_msg *msg,
+			    void *priv)
+{
+	struct aplic_msi_data *msi_data = priv;
+	u32 guest_index = 0;
+	u32 eiid;
+
+	eiid = msg->data;
+	if (!eiid || eiid > APLIC_TARGET_EIID_MASK)
+		return;
+
+	aplic_program_msi_target(msi_data->aplic, msi_data->hwirq,
+				derive_hart_index(&msi_data->aplic->msicfg_mmode, msg),
+				guest_index, eiid);
+}
+
+static int aplic_msi_callback(u32 parent_hwirq, void *priv)
+{
+	struct aplic_msi_data *msi_data = priv;
+	int rc;
+
+	rc = sbi_irqchip_process_hwirq(&msi_data->aplic->irqchip, msi_data->hwirq);
+	if (rc && rc != SBI_ENOENT)
+		sbi_printf("%s: hwirq=%lu failed rc=%d\n",
+			__func__,
+			(unsigned long)parent_hwirq, rc);
+
+	return rc;
+}
+
+static int aplic_setup_msi(struct aplic_data *aplic, u32 hwirq)
+{
+	struct sbi_irqchip_device *parent;
+	u32 first_hwirq;
+	struct aplic_msi_data *msi_data;
+	int rc;
+
+	parent = sbi_irqchip_find_device(aplic->parent_unique_id);
+	if (!parent) {
+		sbi_printf("%s: msi_parent is NULL hwirq=%lu\n",
+			__func__, (unsigned long)hwirq);
+		return SBI_EINVAL;
+	}
+
+	msi_data = sbi_zalloc(sizeof(struct aplic_msi_data));
+	if (!msi_data)
+		return SBI_ENOMEM;
+
+	msi_data->aplic = aplic;
+	msi_data->hwirq = hwirq;
+
+	rc = sbi_irqchip_register_msi(parent, 1,
+					aplic_write_msi,
+					aplic_msi_callback,
+					msi_data,
+					&first_hwirq);
+	if (rc) {
+		sbi_printf("%s: register_msi failed hwirq=%lu rc=%d\n",
+			__func__, (unsigned long)hwirq, rc);
+		sbi_free(msi_data);
+		return rc;
+	}
+
+	msi_data->parent_hwirq = first_hwirq;
+	sbi_irqchip_set_hwirq_priv(&aplic->irqchip, hwirq, msi_data);
+
+	return 0;
+}
+
 static int aplic_hwirq_setup(struct sbi_irqchip_device *chip,
 			     u32 hwirq, u32 hwirq_flags)
 {
@@ -412,21 +559,26 @@ static int aplic_hwirq_setup(struct sbi_irqchip_device *chip,
 
 	sourcecfg = aplic_hwirq_flags_to_sourcecfg(hwirq_flags);
 	if (sourcecfg == APLIC_SOURCECFG_SM_INACTIVE) {
-		sbi_printf("aplic_hwirq_setup: unsupported flags=0x%lx hwirq=%lu\n",
-			   (unsigned long)hwirq_flags,
-			   (unsigned long)hwirq);
+		sbi_printf("%s: unsupported flags=0x%lx hwirq=%lu\n",
+			__func__,
+			(unsigned long)hwirq_flags,
+			(unsigned long)hwirq);
 		return SBI_EINVAL;
 	}
+
 	aplic_sourcecfg_write(aplic, hwirq, sourcecfg);
 
 	if (aplic_hwirq_is_delegated(aplic, hwirq)) {
-		sbi_printf("aplic_hwirq_setup: hwirq=%lu is delegated\n",
-			   (unsigned long)hwirq);
+		sbi_printf("%s: hwirq=%lu is delegated\n",
+			__func__, (unsigned long)hwirq);
 		return SBI_ENOTSUPP;
 	}
 
 	aplic_irq_clrie(aplic, hwirq);
 	aplic_irq_clrip(aplic, hwirq);
+
+	if (!aplic_is_direct_mode(aplic))
+		return aplic_setup_msi(aplic, hwirq);
 
 	return 0;
 }
@@ -434,6 +586,7 @@ static int aplic_hwirq_setup(struct sbi_irqchip_device *chip,
 static void aplic_hwirq_cleanup(struct sbi_irqchip_device *chip, u32 hwirq)
 {
 	struct aplic_data *aplic;
+	struct aplic_msi_data *msi_data;
 
 	aplic = container_of(chip, struct aplic_data, irqchip);
 	if (aplic_hwirq_is_delegated(aplic, hwirq))
@@ -443,17 +596,41 @@ static void aplic_hwirq_cleanup(struct sbi_irqchip_device *chip, u32 hwirq)
 	aplic_irq_clrip(aplic, hwirq);
 	aplic_sourcecfg_write(aplic, hwirq, APLIC_SOURCECFG_SM_INACTIVE);
 	aplic_target_write(aplic, hwirq, APLIC_DEFAULT_PRIORITY);
+	msi_data = (struct aplic_msi_data *) sbi_irqchip_get_hwirq_priv(chip, hwirq);
+	if (msi_data)
+		sbi_free(msi_data);
 }
 
 static int aplic_hwirq_set_affinity(struct sbi_irqchip_device *chip,
 				    u32 hwirq, u32 hart_index)
 {
 	struct aplic_data *aplic;
+	struct aplic_msi_data *msi_data;
+	struct sbi_irqchip_device *parent;
 	int idc_index;
+	int rc;
 
 	aplic = container_of(chip, struct aplic_data, irqchip);
 	if (aplic_hwirq_is_delegated(aplic, hwirq))
 		return SBI_ENOTSUPP;
+
+	if (!aplic_is_direct_mode(aplic)) {
+		parent = sbi_irqchip_find_device(aplic->parent_unique_id);
+		if (!parent) {
+			sbi_printf("%s: msi_parent is NULL hwirq=%lu\n",
+				__func__, (unsigned long)hwirq);
+			return SBI_EINVAL;
+		}
+
+		msi_data = sbi_irqchip_get_hwirq_priv(chip, hwirq);
+		rc = sbi_irqchip_set_affinity(parent, msi_data->parent_hwirq, hart_index);
+		if (rc) {
+			sbi_printf("%s: sbi_irqchip_set_affinity failed hwirq=%lu rc=%d\n",
+				__func__, (unsigned long)hwirq, rc);
+			return rc;
+		}
+		return 0;
+	}
 
 	idc_index = aplic_find_idc_index(aplic, hart_index);
 	if (idc_index < 0)
@@ -489,12 +666,13 @@ static void aplic_hwirq_unmask(struct sbi_irqchip_device *chip, u32 hwirq)
 }
 
 static struct sbi_irqchip_device aplic_irqchip_template = {
-	.warm_init		= aplic_warm_init,
+	.warm_init			= aplic_warm_init,
 	.process_hwirqs		= aplic_process_hwirqs,
+	.hwirq_eoi			= aplic_hwirq_eoi,
 	.hwirq_setup		= aplic_hwirq_setup,
 	.hwirq_cleanup		= aplic_hwirq_cleanup,
 	.hwirq_set_affinity	= aplic_hwirq_set_affinity,
-	.hwirq_mask		= aplic_hwirq_mask,
+	.hwirq_mask			= aplic_hwirq_mask,
 	.hwirq_unmask		= aplic_hwirq_unmask,
 };
 
@@ -503,21 +681,46 @@ int aplic_cold_irqchip_init(struct aplic_data *aplic)
 	int rc;
 	struct aplic_delegate_data *deleg;
 	u32 first_deleg_irq, last_deleg_irq, i;
+	bool msi_mode;
 
-	/* Sanity checks */
-	if (!aplic ||
-	    !aplic->num_source || APLIC_MAX_SOURCE <= aplic->num_source ||
-	    APLIC_MAX_IDC <= aplic->num_idc)
+	msi_mode = !aplic_is_direct_mode(aplic);
+	if (!aplic->num_source) {
+		sbi_printf("%s: num_source is zero\n", __func__);
 		return SBI_EINVAL;
+	}
+
+	if (APLIC_MAX_SOURCE <= aplic->num_source) {
+		sbi_printf("%s: num_source=%lu exceeds max=%lu\n",
+			__func__,
+			(unsigned long)aplic->num_source,
+			(unsigned long)APLIC_MAX_SOURCE);
+		return SBI_EINVAL;
+	}
+
+	if (!msi_mode && APLIC_MAX_IDC <= aplic->num_idc) {
+		sbi_printf("%s: num_idc=%lu exceeds max=%lu\n",
+			__func__,
+			(unsigned long)aplic->num_idc,
+			(unsigned long)APLIC_MAX_IDC);
+		return SBI_EINVAL;
+	}
+
 	if (aplic->targets_mmode && aplic->has_msicfg_mmode) {
 		rc = aplic_check_msicfg(&aplic->msicfg_mmode);
-		if (rc)
+		if (rc) {
+			sbi_printf("%s: invalid M-mode msicfg rc=%d\n",
+				__func__, rc);
 			return rc;
+		}
 	}
+
 	if (aplic->targets_mmode && aplic->has_msicfg_smode) {
 		rc = aplic_check_msicfg(&aplic->msicfg_smode);
-		if (rc)
+		if (rc) {
+			sbi_printf("%s: invalid S-mode msicfg rc=%d\n",
+				__func__, rc);
 			return rc;
+		}
 	}
 
 	/* Init the APLIC registers */
@@ -550,22 +753,31 @@ int aplic_cold_irqchip_init(struct aplic_data *aplic)
 			return rc;
 	}
 
-	if ((aplic->targets_mmode) && aplic_is_direct_mode(aplic)) {
+	if ((aplic->targets_mmode)) {
 		aplic->irqchip		 = aplic_irqchip_template;
 		aplic->irqchip.id	 = aplic->unique_id;
 		aplic->irqchip.caps = SBI_IRQCHIP_CAPS_WIRED;
 		aplic->irqchip.num_hwirq = aplic->num_source + 1;
 
-		for (i = 0; i < aplic->num_idc; i++)
-			sbi_hartmask_set_hartindex(aplic->idc_map[i],
-						   &aplic->irqchip.target_harts);
+		if (msi_mode) {
+			aplic->irqchip.warm_init      = NULL;
+			aplic->irqchip.process_hwirqs = NULL;
+			aplic->irqchip.hwirq_eoi      = NULL;
+		}
+
+		if (msi_mode)
+			sbi_hartmask_set_all(&aplic->irqchip.target_harts);
+		else
+			for (i = 0; i < aplic->num_idc; i++)
+				sbi_hartmask_set_hartindex(aplic->idc_map[i],
+							   &aplic->irqchip.target_harts);
 
 		rc = sbi_irqchip_add_device(&aplic->irqchip);
 		if (rc) {
-			sbi_printf("aplic_cold_irqchip_init: sbi_irqchip_add_device failed rc=%d id=%lu mode=%s target_weight=%lu\n",
-				rc,
+			sbi_printf("%s: sbi_irqchip_add_device failed rc=%d id=%lu mode=%s target_weight=%lu\n",
+				__func__, rc,
 				(unsigned long)aplic->irqchip.id,
-				"direct",
+				msi_mode ? "msi" : "direct",
 				(unsigned long)sbi_hartmask_weight(
 					&aplic->irqchip.target_harts));
 			return rc;
