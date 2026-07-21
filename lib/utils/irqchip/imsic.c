@@ -149,7 +149,12 @@ int imsic_get_target_file(u32 hartindex)
 
 static int imsic_process_hwirqs(struct sbi_irqchip_device *chip)
 {
+	struct imsic_data *imsic;
 	ulong mirq;
+
+	imsic = container_of(chip, struct imsic_data, irqchip);
+	if (!imsic || !imsic->targets_mmode)
+		return SBI_EINVAL;
 
 	while ((mirq = csr_swap(CSR_MTOPEI, 0))) {
 		mirq = (mirq >> IMSIC_TOPEI_ID_SHIFT);
@@ -258,10 +263,15 @@ void imsic_local_irqchip_init(void)
 
 static int imsic_warm_irqchip_init(struct sbi_irqchip_device *dev)
 {
-	struct imsic_data *imsic = imsic_get_data(current_hartindex());
+	struct imsic_data *imsic;
+	struct imsic_data *hart_imsic;
+
+	imsic = container_of(dev, struct imsic_data, irqchip);
+	hart_imsic = imsic_get_data(current_hartindex());
 
 	/* Sanity checks */
-	if (!imsic || !imsic->targets_mmode)
+	if (!hart_imsic || hart_imsic != imsic ||
+		!hart_imsic->targets_mmode)
 		return SBI_EINVAL;
 
 	/* Disable all interrupts */
@@ -399,16 +409,17 @@ int imsic_cold_irqchip_init(struct imsic_data *imsic)
 	}
 
 	/* Register irqchip device */
-	imsic_device.id = imsic->unique_id;
+	imsic->irqchip = imsic_device;
+	imsic->irqchip.id = imsic->unique_id;
 	imsic_device.caps = SBI_IRQCHIP_CAPS_MSI;
-	imsic_device.num_hwirq = imsic->num_ids + 1;
-	sbi_hartmask_set_all(&imsic_device.target_harts);
-	rc = sbi_irqchip_add_device(&imsic_device);
+	imsic->irqchip.num_hwirq = imsic->num_ids + 1;
+	sbi_hartmask_set_all(&imsic->irqchip.target_harts);
+	rc = sbi_irqchip_add_device(&imsic->irqchip);
 	if (rc)
 		return rc;
 
 	/* Mark hwirq 0 and IPI hwirq as reserved */
-	rc = sbi_irqchip_register_reserved(&imsic_device, 0, IMSIC_IPI_ID + 1);
+	rc = sbi_irqchip_register_reserved(&imsic->irqchip, 0, IMSIC_IPI_ID + 1);
 	if (rc)
 		return rc;
 
