@@ -168,4 +168,8 @@ int sbi_irqchip_init(struct sbi_scratch *scratch, bool cold_boot);
 /** Exit interrupt controllers */
 void sbi_irqchip_exit(struct sbi_scratch *scratch);
 
+/** Check if the interrupt is enabled */
+bool sbi_irqchip_is_hwirq_enabled(struct sbi_irqchip_device *chip,
+				   u32 hwirq);
+
 #endif

@@ -20,6 +20,11 @@ struct sbi_irqchip_hwirq_data {
 	/** raw hardware interrupt handler */
 	int (*raw_handler)(struct sbi_irqchip_device *chip, u32 hwirq);
 
+#define IRQ_ENABLED	BIT(0)
+	/** interrupt state
+	 * bit 0 - 1: enabled, 0: disabled */
+	u32 irq_state;
+
 	/** target hart index */
 	u32 hart_index;
 
@@ -80,23 +85,54 @@ int sbi_irqchip_process_hwirq(struct sbi_irqchip_device *chip, u32 hwirq)
 	return data->raw_handler(chip, hwirq);
 }
 
+static inline u32 sbi_irqchip_get_irq_state(struct sbi_irqchip_device *chip,
+					     u32 hwirq)
+{
+	if (!chip || !chip->hwirqs || hwirq >= chip->num_hwirq)
+		return 0;
+
+	return chip->hwirqs[hwirq].irq_state;
+}
+
+bool sbi_irqchip_is_hwirq_enabled(struct sbi_irqchip_device *chip,
+				   u32 hwirq)
+{
+	return !!(sbi_irqchip_get_irq_state(chip, hwirq) & IRQ_ENABLED);
+}
+
 int sbi_irqchip_unmask_hwirq(struct sbi_irqchip_device *chip, u32 hwirq)
 {
+	struct sbi_irqchip_hwirq_data *data;
+
 	if (!chip || chip->num_hwirq <= hwirq)
 		return SBI_EINVAL;
 
+	data = &chip->hwirqs[hwirq];
+	if (sbi_irqchip_is_hwirq_enabled(chip, hwirq))
+		return SBI_EALREADY;
+
 	if (chip->hwirq_unmask)
 		chip->hwirq_unmask(chip, hwirq);
+
+	data->irq_state |= IRQ_ENABLED;
 	return 0;
 }
 
 int sbi_irqchip_mask_hwirq(struct sbi_irqchip_device *chip, u32 hwirq)
 {
+	struct sbi_irqchip_hwirq_data *data;
+
 	if (!chip || chip->num_hwirq <= hwirq)
 		return SBI_EINVAL;
 
+	if (!sbi_irqchip_is_hwirq_enabled(chip, hwirq))
+		return SBI_EALREADY;
+
 	if (chip->hwirq_mask)
 		chip->hwirq_mask(chip, hwirq);
+
+	data = &chip->hwirqs[hwirq];
+	data->irq_state &= ~IRQ_ENABLED;
 	return 0;
 }
 
