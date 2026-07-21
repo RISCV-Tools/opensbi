@@ -145,14 +145,36 @@ static inline bool mpxy_is_std_attr(u32 attr_id)
 	return (attr_id >> 31) ? false : true;
 }
 
-/** Find channel_id in registered channels list */
-static struct sbi_mpxy_channel *mpxy_find_channel(u32 channel_id)
+static inline bool mpxy_channel_visible(struct sbi_mpxy_channel *channel,
+					struct sbi_domain *dom)
+{
+	return channel->owner_domain == dom;
+}
+
+/** Find channel_id in registered channels list for this domain */
+static struct sbi_mpxy_channel *mpxy_find_channel(u32 channel_id,
+					struct sbi_domain *dom)
 {
 	struct sbi_mpxy_channel *channel;
 
-	sbi_list_for_each_entry(channel, &mpxy_channel_list, head)
+	sbi_list_for_each_entry(channel, &mpxy_channel_list, head) {
+		if (channel->channel_id == channel_id &&
+		    mpxy_channel_visible(channel, dom))
+			return channel;
+	}
+
+	return NULL;
+}
+
+/** Find channel_id in registered channels list */
+struct sbi_mpxy_channel *sbi_mpxy_find_channel_any(u32 channel_id)
+{
+	struct sbi_mpxy_channel *channel;
+
+	sbi_list_for_each_entry(channel, &mpxy_channel_list, head) {
 		if (channel->channel_id == channel_id)
 			return channel;
+	}
 
 	return NULL;
 }
@@ -224,7 +246,10 @@ int sbi_mpxy_register_channel(struct sbi_mpxy_channel *channel)
 	if (!channel)
 		return SBI_EINVAL;
 
-	if (mpxy_find_channel(channel->channel_id))
+	if (!channel->owner_domain)
+		return SBI_EINVAL;
+
+	if (sbi_mpxy_find_channel_any(channel->channel_id))
 		return SBI_EALREADY;
 
 	/* Initialize channel specific attributes */
@@ -397,12 +422,15 @@ int sbi_mpxy_get_channel_ids(u32 start_index)
 	struct sbi_mpxy_channel *channel;
 	u32 channels_count = 0;
 	u32 *shmem_base;
+	struct sbi_domain *dom = sbi_domain_thishart_ptr();
 
 	if (!mpxy_shmem_enabled(ms))
 		return SBI_ERR_NO_SHMEM;
 
-	sbi_list_for_each_entry(channel, &mpxy_channel_list, head)
-		channels_count += 1;
+	sbi_list_for_each_entry(channel, &mpxy_channel_list, head) {
+		if (mpxy_channel_visible(channel, dom))
+			channels_count += 1;
+	}
 
 	if (start_index > channels_count)
 		return SBI_ERR_INVALID_PARAM;
@@ -420,6 +448,9 @@ int sbi_mpxy_get_channel_ids(u32 start_index)
 
 	// Iterate over the list of channels to get the channel ids.
 	sbi_list_for_each_entry(channel, &mpxy_channel_list, head) {
+		if (!mpxy_channel_visible(channel, sbi_domain_thishart_ptr()))
+			continue;
+
 		if (node_index >= start_index &&
 			node_index < (start_index + returned)) {
 			shmem_base[2 + node_ret] = cpu_to_le32(channel->channel_id);
@@ -446,11 +477,12 @@ int sbi_mpxy_read_attrs(u32 channel_id, u32 base_attr_id, u32 attr_count)
 	int ret = SBI_SUCCESS;
 	u32 *attr_ptr, end_id;
 	void *shmem_base;
+	struct sbi_domain *dom = sbi_domain_thishart_ptr();
 
 	if (!mpxy_shmem_enabled(ms))
 		return SBI_ERR_NO_SHMEM;
 
-	struct sbi_mpxy_channel *channel = mpxy_find_channel(channel_id);
+	struct sbi_mpxy_channel *channel = mpxy_find_channel(channel_id, dom);
 	if (!channel)
 		return SBI_ERR_NOT_SUPPORTED;
 
@@ -597,11 +629,12 @@ int sbi_mpxy_write_attrs(u32 channel_id, u32 base_attr_id, u32 attr_count)
 	struct sbi_mpxy_channel *channel;
 	int ret, mem_idx;
 	void *shmem_base;
+	struct sbi_domain *dom = sbi_domain_thishart_ptr();
 
 	if (!mpxy_shmem_enabled(ms))
 		return SBI_ERR_NO_SHMEM;
 
-	channel = mpxy_find_channel(channel_id);
+	channel = mpxy_find_channel(channel_id, dom);
 	if (!channel)
 		return SBI_ERR_NOT_SUPPORTED;
 
@@ -686,12 +719,13 @@ int sbi_mpxy_send_message(u32 channel_id, u8 msg_id,
 	struct sbi_mpxy_channel *channel;
 	void *shmem_base, *resp_buf;
 	u32 resp_bufsize;
+	struct sbi_domain *dom = sbi_domain_thishart_ptr();
 	int ret;
 
 	if (!mpxy_shmem_enabled(ms))
 		return SBI_ERR_NO_SHMEM;
 
-	channel = mpxy_find_channel(channel_id);
+	channel = mpxy_find_channel(channel_id, dom);
 	if (!channel)
 		return SBI_ERR_NOT_SUPPORTED;
 
@@ -743,12 +777,13 @@ int sbi_mpxy_get_notification_events(u32 channel_id, unsigned long *events_len)
 	struct mpxy_state *ms = sbi_domain_mpxy_state_thishart_ptr();
 	struct sbi_mpxy_channel *channel;
 	void *eventsbuf, *shmem_base;
+	struct sbi_domain *dom = sbi_domain_thishart_ptr();
 	int ret;
 
 	if (!mpxy_shmem_enabled(ms))
 		return SBI_ERR_NO_SHMEM;
 
-	channel = mpxy_find_channel(channel_id);
+	channel = mpxy_find_channel(channel_id, dom);
 	if (!channel || !channel->get_notification_events)
 		return SBI_ERR_NOT_SUPPORTED;
 
